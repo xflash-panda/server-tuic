@@ -96,7 +96,7 @@ mod tests {
 		time::Duration,
 	};
 
-	use acl_engine_rs::outbound::{Direct, Http, Reject, Socks5};
+	use acl_engine_rs::outbound::{Http, Reject, Socks5};
 	use dns_cache_rs::{DnsCache, MockResolver};
 	use tuic::Address;
 
@@ -109,7 +109,9 @@ mod tests {
 	}
 
 	fn direct_handler() -> OutboundHandler {
-		OutboundHandler::Direct(Arc::new(Direct::new()))
+		OutboundHandler::Direct(Arc::new(crate::acl::DirectOutbound::with_mode(
+			acl_engine_rs::outbound::DirectMode::Auto,
+		)))
 	}
 
 	fn socks5_handler() -> OutboundHandler {

@@ -147,35 +147,18 @@ impl UdpSession {
 		Ok(Arc::downgrade(&session))
 	}
 
-	pub async fn send(&self, pkt: Bytes, mut addr: SocketAddr) -> Result<(), Error> {
-		// Normalize IPv4-mapped IPv6 targets (`::ffff:a.b.c.d`) back to plain IPv4 so
-		// they are routed to the IPv4 socket. The IPv6 socket is bound
-		// `set_only_v6(true)`, so an IPv4-mapped address would otherwise fail to send
-		// (or be rejected as IPv6-disabled).
-		if let SocketAddr::V6(v6) = addr {
-			if let Some(v4) = v6.ip().to_ipv4_mapped() {
-				addr = SocketAddr::new(IpAddr::V4(v4), v6.port());
-			}
-		}
-
-		let socket = match addr {
-			SocketAddr::V4(_) => &self.socket_v4,
-			SocketAddr::V6(_) => self.socket_v6.as_ref().ok_or_else(|| Error::UdpRelayIpv6Disabled(addr))?,
-		};
-
-		socket.send_to(&pkt, addr).await?;
-		Ok(())
+	/// Send `pkt` to the first reachable target, trying candidates in preferred
+	/// order (see [`send_to_first`]). Passing more than one target lets the
+	/// caller express a family fallback (e.g. Prefer64's `[v6, v4]`).
+	pub async fn send(&self, pkt: Bytes, targets: &[SocketAddr]) -> Result<(), Error> {
+		send_to_first(&self.socket_v4, self.socket_v6.as_ref(), &pkt, targets).await
 	}
 
 	async fn recv(&self) -> Result<(Bytes, SocketAddr), IoError> {
 		let recv = async |socket: &UdpSocket| -> Result<(Bytes, SocketAddr), IoError> {
 			let mut buf = vec![0u8; self.ctx.cfg.max_external_packet_size];
-			let (n, mut addr) = socket.recv_from(&mut buf).await?;
-			if let SocketAddr::V6(v6) = addr {
-				if let Some(v4) = v6.ip().to_ipv4_mapped() {
-					addr = SocketAddr::new(IpAddr::V4(v4), v6.port());
-				}
-			}
+			let (n, addr) = socket.recv_from(&mut buf).await?;
+			let addr = normalize_v4_mapped(addr);
 			buf.truncate(n);
 			Ok((Bytes::from(buf), addr))
 		};
@@ -194,5 +177,120 @@ impl UdpSession {
 		if let Some(v) = self.close.write().await.take() {
 			_ = v.send(());
 		}
+	}
+}
+
+/// Normalize an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) back to plain IPv4
+/// so it is routed to the IPv4 socket. The IPv6 socket is bound
+/// `set_only_v6(true)`, so a mapped address would otherwise fail to send.
+fn normalize_v4_mapped(addr: SocketAddr) -> SocketAddr {
+	if let SocketAddr::V6(v6) = addr
+		&& let Some(v4) = v6.ip().to_ipv4_mapped()
+	{
+		return SocketAddr::new(IpAddr::V4(v4), v6.port());
+	}
+	addr
+}
+
+/// Send `pkt` to the first reachable target, trying candidates in order and
+/// advancing to the next on any send error. IPv6 targets require `socket_v6`;
+/// when it is absent (IPv6 relay disabled) the IPv6 attempt errors and the loop
+/// falls back to the next candidate — this is how a Prefer64 target degrades to
+/// IPv4. Returns the last error if every candidate fails.
+async fn send_to_first(
+	socket_v4: &UdpSocket,
+	socket_v6: Option<&UdpSocket>,
+	pkt: &[u8],
+	targets: &[SocketAddr],
+) -> Result<(), Error> {
+	let mut last_err = None;
+	for &target in targets {
+		let addr = normalize_v4_mapped(target);
+		let res = match addr {
+			SocketAddr::V4(_) => socket_v4.send_to(pkt, addr).await.map_err(Error::from),
+			SocketAddr::V6(_) => match socket_v6 {
+				Some(sock) => sock.send_to(pkt, addr).await.map_err(Error::from),
+				None => Err(Error::UdpRelayIpv6Disabled(addr)),
+			},
+		};
+		match res {
+			Ok(_) => return Ok(()),
+			Err(err) => last_err = Some(err),
+		}
+	}
+	Err(last_err.unwrap_or_else(|| {
+		Error::Socket(
+			"no UDP target address",
+			IoError::new(std::io::ErrorKind::InvalidInput, "empty target list"),
+		)
+	}))
+}
+
+#[cfg(test)]
+mod tests {
+	use std::{
+		net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+		time::Duration,
+	};
+
+	use tokio::net::UdpSocket;
+
+	use super::{Error, send_to_first};
+
+	async fn recv_with_timeout(server: &UdpSocket) -> Vec<u8> {
+		let mut buf = [0u8; 16];
+		let (n, _) = tokio::time::timeout(Duration::from_secs(2), server.recv_from(&mut buf))
+			.await
+			.expect("server must receive before timeout")
+			.expect("recv_from ok");
+		buf[..n].to_vec()
+	}
+
+	#[tokio::test]
+	async fn falls_back_to_ipv4_when_ipv6_socket_absent() {
+		// Prefer64 ordering [v6, v4] with no IPv6 socket: the v6 attempt errors
+		// and the datagram must still be delivered via the IPv4 fallback.
+		let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let port = server.local_addr().unwrap().port();
+		let sender_v4 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+		let targets = [
+			SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port),
+			SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+		];
+
+		send_to_first(&sender_v4, None, b"ping", &targets)
+			.await
+			.expect("must deliver via IPv4 fallback");
+
+		assert_eq!(recv_with_timeout(&server).await, b"ping");
+	}
+
+	#[tokio::test]
+	async fn ipv4_mapped_ipv6_target_routes_to_ipv4_socket() {
+		// A `::ffff:127.0.0.1` target with only a v4 socket must be normalized
+		// to IPv4 and delivered, not rejected as IPv6.
+		let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let port = server.local_addr().unwrap().port();
+		let sender_v4 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+		let mapped = SocketAddr::new(IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()), port);
+		send_to_first(&sender_v4, None, b"map", &[mapped])
+			.await
+			.expect("mapped target must route to the v4 socket");
+
+		assert_eq!(recv_with_timeout(&server).await, b"map");
+	}
+
+	#[tokio::test]
+	async fn errors_when_all_targets_fail() {
+		// Only an IPv6 target but no IPv6 socket: no candidate can be sent.
+		let sender_v4 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let target = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 9);
+
+		let err = send_to_first(&sender_v4, None, b"x", &[target])
+			.await
+			.expect_err("must fail when the only target is unreachable");
+		assert!(matches!(err, Error::UdpRelayIpv6Disabled(_)));
 	}
 }
