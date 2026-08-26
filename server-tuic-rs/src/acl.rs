@@ -91,6 +91,10 @@ pub struct DirectConfig {
 		rename = "tcpKeepalive"
 	)]
 	pub tcp_keepalive: Option<u64>,
+
+	/// Connection timeout in seconds (0 = use acl-engine's default of 10s)
+	#[serde(default, rename = "connectTimeout")]
+	pub connect_timeout: u64,
 }
 
 fn default_true() -> bool {
@@ -169,11 +173,42 @@ pub struct AclRules {
 	pub inline: Vec<String>,
 }
 
+/// A `Direct` outbound paired with its family-selection mode.
+///
+/// acl-engine's `Direct` keeps its `mode` field private with no accessor, so we
+/// retain a copy here — set from the same options at construction — for the UDP
+/// relay path, which orders send targets by family preference (Prefer64/
+/// Prefer46/Only*).
+pub struct DirectOutbound {
+	inner: Direct,
+	mode:  DirectMode,
+}
+
+impl DirectOutbound {
+	/// Build from full [`DirectOptions`]. `mode` is taken from the same options
+	/// used to construct the inner `Direct`, so the copy retained here can
+	/// never diverge from the dialer's actual behavior.
+	pub(crate) fn from_options(opts: DirectOptions) -> Result<Self> {
+		let mode = opts.mode;
+		let inner = Direct::with_options(opts).map_err(|e| eyre::eyre!("Failed to create direct outbound: {}", e))?;
+		Ok(Self { inner, mode })
+	}
+
+	/// Build a `Direct` with only a family-selection mode (all other options
+	/// default). Infallible; `mode` is single-sourced, so no divergence.
+	pub(crate) fn with_mode(mode: DirectMode) -> Self {
+		Self {
+			inner: Direct::with_mode(mode),
+			mode,
+		}
+	}
+}
+
 /// Wrapper for async outbound handlers from acl-engine-rs
 #[derive(Clone)]
 pub enum OutboundHandler {
 	/// Direct connection using acl-engine-rs's Direct
-	Direct(Arc<Direct>),
+	Direct(Arc<DirectOutbound>),
 	/// SOCKS5 proxy using acl-engine-rs's Socks5
 	Socks5 { inner: Arc<Socks5>, allow_udp: bool },
 	/// HTTP proxy using acl-engine-rs's Http
@@ -201,18 +236,17 @@ impl OutboundHandler {
 				OutboundEntryConfig::Direct { direct } => {
 					let cfg = direct.as_ref().cloned().unwrap_or_default();
 					let opts = DirectOptions {
-						mode: cfg.mode.into(),
-						bind_ip4: cfg.bind_ipv4.as_deref().and_then(|s| s.parse().ok()),
-						bind_ip6: cfg.bind_ipv6.as_deref().and_then(|s| s.parse().ok()),
-						bind_device: cfg.bind_device,
-						fast_open: cfg.fast_open,
-						tcp_nodelay: cfg.tcp_nodelay,
+						mode:          cfg.mode.into(),
+						bind_ip4:      cfg.bind_ipv4.as_deref().and_then(|s| s.parse().ok()),
+						bind_ip6:      cfg.bind_ipv6.as_deref().and_then(|s| s.parse().ok()),
+						bind_device:   cfg.bind_device,
+						fast_open:     cfg.fast_open,
+						tcp_nodelay:   cfg.tcp_nodelay,
 						tcp_keepalive: cfg.tcp_keepalive.map(Duration::from_secs),
-						..Default::default()
+						// 0 => None => acl-engine default (10s); otherwise the configured seconds.
+						timeout:       (cfg.connect_timeout != 0).then(|| Duration::from_secs(cfg.connect_timeout)),
 					};
-					let inner =
-						Direct::with_options(opts).map_err(|e| eyre::eyre!("Failed to create direct outbound: {}", e))?;
-					Ok(OutboundHandler::Direct(Arc::new(inner)))
+					Ok(OutboundHandler::Direct(Arc::new(DirectOutbound::from_options(opts)?)))
 				}
 				_ => eyre::bail!("Invalid config for direct outbound '{}'", entry.name),
 			},
@@ -248,6 +282,23 @@ impl OutboundHandler {
 		matches!(self, OutboundHandler::Reject(_))
 	}
 
+	/// Check if this handler is a Direct outbound. tuic can only relay UDP for
+	/// Direct outbounds (via its own sockets); proxied outbounds must resolve
+	/// and connect through the proxy, which the UDP path cannot do.
+	pub fn is_direct(&self) -> bool {
+		matches!(self, OutboundHandler::Direct(_))
+	}
+
+	/// Family-selection mode for a `Direct` outbound, used by the UDP relay
+	/// path to order send targets by family preference. Returns `None` for
+	/// proxied/reject outbounds, which resolve the target family themselves.
+	pub fn direct_mode(&self) -> Option<DirectMode> {
+		match self {
+			OutboundHandler::Direct(d) => Some(d.mode),
+			_ => None,
+		}
+	}
+
 	/// Check if UDP is allowed for this handler
 	pub fn allows_udp(&self) -> bool {
 		match self {
@@ -261,7 +312,7 @@ impl OutboundHandler {
 	/// Get the async outbound implementation for TCP
 	pub fn as_async_outbound(&self) -> &dyn AsyncOutbound {
 		match self {
-			OutboundHandler::Direct(d) => d.as_ref(),
+			OutboundHandler::Direct(d) => &d.inner,
 			OutboundHandler::Socks5 { inner, .. } => inner.as_ref(),
 			OutboundHandler::Http(h) => h.as_ref(),
 			OutboundHandler::Reject(r) => r.as_ref(),
@@ -294,7 +345,7 @@ impl AclEngine {
 			tracing::debug!("No outbounds defined, creating default direct outbound");
 			outbounds.insert(
 				"default".to_string(),
-				Arc::new(OutboundHandler::Direct(Arc::new(Direct::new()))),
+				Arc::new(OutboundHandler::Direct(Arc::new(DirectOutbound::with_mode(DirectMode::Auto)))),
 			);
 		}
 
@@ -305,7 +356,7 @@ impl AclEngine {
 			.or_insert_with(|| Arc::new(OutboundHandler::Reject(Arc::new(Reject::new()))));
 		outbounds
 			.entry("direct".to_string())
-			.or_insert_with(|| Arc::new(OutboundHandler::Direct(Arc::new(Direct::new()))));
+			.or_insert_with(|| Arc::new(OutboundHandler::Direct(Arc::new(DirectOutbound::with_mode(DirectMode::Auto)))));
 
 		// Get rules or use default
 		let rules = if acl_config.acl.inline.is_empty() {
@@ -587,6 +638,38 @@ acl:
 		assert_eq!(v6, IpMode::V6Only);
 	}
 
+	#[test]
+	fn test_direct_config_parses_connect_timeout() {
+		let cfg: DirectConfig = serde_yaml::from_str("mode: auto\nconnectTimeout: 5\n").expect("parse");
+		assert_eq!(cfg.connect_timeout, 5);
+	}
+
+	#[test]
+	fn test_direct_config_connect_timeout_defaults_to_zero() {
+		// Absent connectTimeout means "use acl-engine's default" (10s), encoded as 0.
+		let cfg: DirectConfig = serde_yaml::from_str("mode: auto\n").expect("parse");
+		assert_eq!(cfg.connect_timeout, 0);
+	}
+
+	/// A direct outbound with an explicit connectTimeout constructs
+	/// successfully (the value is wired into DirectOptions.timeout in
+	/// `from_entry`).
+	#[test]
+	fn test_direct_config_connect_timeout_builds_handler() {
+		let entry = OutboundEntry {
+			name:          "direct".to_string(),
+			outbound_type: "direct".to_string(),
+			config:        OutboundEntryConfig::Direct {
+				direct: Some(DirectConfig {
+					connect_timeout: 3,
+					..Default::default()
+				}),
+			},
+		};
+		let handler = OutboundHandler::from_entry(&entry).expect("handler builds with connectTimeout");
+		assert!(matches!(handler, OutboundHandler::Direct(_)));
+	}
+
 	/// Test ACL rule matching based on acl-o.yaml style config
 	#[tokio::test]
 	async fn test_acl_rule_matching_with_socks5_outbound() {
@@ -672,8 +755,7 @@ acl:
 		});
 
 		// Create Direct outbound
-		let direct = Direct::new();
-		let handler = OutboundHandler::Direct(Arc::new(direct));
+		let handler = OutboundHandler::Direct(Arc::new(DirectOutbound::with_mode(DirectMode::Auto)));
 
 		// Dial TCP using AsyncOutbound
 		let mut addr = Addr::new("127.0.0.1", port);
@@ -694,6 +776,43 @@ acl:
 
 		// Wait for server to finish
 		server_handle.await.unwrap();
+	}
+
+	/// Prefer64 direct TCP dials IPv6 first but must fall back to IPv4 when the
+	/// IPv6 route is dead (host has an AAAA record yet no working v6 path).
+	/// Exercised through tuic's `OutboundHandler` with tuic-supplied
+	/// `resolve_info` and a v4-only listener: `[::1]:port` is refused,
+	/// `127.0.0.1:port` accepts. Regression guard for the v0.4.6
+	/// connection-level Prefer fallback reaching tuic's TCP path (would fail
+	/// on v0.4.5).
+	#[tokio::test]
+	async fn test_direct_prefer64_tcp_falls_back_to_ipv4() {
+		use std::net::{Ipv4Addr, Ipv6Addr};
+
+		use acl_engine_rs::outbound::ResolveInfo;
+		use tokio::net::TcpListener;
+
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let port = listener.local_addr().unwrap().port();
+		let accept = tokio::spawn(async move { listener.accept().await.ok() });
+
+		let handler = OutboundHandler::Direct(Arc::new(DirectOutbound::with_mode(DirectMode::Prefer64)));
+
+		let mut acl_addr = Addr::new("dual.example", port).with_resolve_info(ResolveInfo {
+			ipv4:  Some(Ipv4Addr::LOCALHOST),
+			ipv6:  Some(Ipv6Addr::LOCALHOST),
+			error: None,
+		});
+
+		let result = handler.as_async_outbound().dial_tcp(&mut acl_addr).await;
+		assert!(
+			result.is_ok(),
+			"Prefer64 must fall back to IPv4 when the IPv6 dial fails: {:?}",
+			result.err().map(|e| e.to_string())
+		);
+
+		drop(result);
+		accept.await.ok();
 	}
 
 	/// Test that AsyncTcpConn from outbound works with tokio I/O
@@ -718,8 +837,7 @@ acl:
 		});
 
 		// Create Direct outbound and dial
-		let direct = Direct::new();
-		let handler = OutboundHandler::Direct(Arc::new(direct));
+		let handler = OutboundHandler::Direct(Arc::new(DirectOutbound::with_mode(DirectMode::Auto)));
 		let mut addr = Addr::new("127.0.0.1", port);
 		let mut tcp_conn = handler.as_async_outbound().dial_tcp(&mut addr).await.unwrap();
 
@@ -835,6 +953,54 @@ acl:
 			}
 			_ => panic!("Expected Http config"),
 		}
+	}
+
+	/// Direct outbound reports its configured family-selection mode so the UDP
+	/// relay path can order send targets by family preference.
+	#[test]
+	fn test_direct_mode_reports_configured_mode() {
+		let handler = OutboundHandler::Direct(Arc::new(DirectOutbound::with_mode(DirectMode::Prefer64)));
+		assert_eq!(handler.direct_mode(), Some(DirectMode::Prefer64));
+
+		let auto = OutboundHandler::Direct(Arc::new(DirectOutbound::with_mode(DirectMode::Auto)));
+		assert_eq!(auto.direct_mode(), Some(DirectMode::Auto));
+	}
+
+	/// `is_direct` is true only for Direct outbounds; the UDP relay uses it to
+	/// refuse proxied outbounds (which tuic cannot relay via its own sockets).
+	#[test]
+	fn test_is_direct_only_for_direct() {
+		let direct = OutboundHandler::Direct(Arc::new(DirectOutbound::with_mode(DirectMode::Auto)));
+		assert!(direct.is_direct());
+
+		let socks = OutboundHandler::Socks5 {
+			inner:     Arc::new(Socks5::new("127.0.0.1:1080")),
+			allow_udp: true,
+		};
+		assert!(!socks.is_direct());
+
+		let http = OutboundHandler::Http(Arc::new(Http::from_url("http://127.0.0.1:8080").unwrap()));
+		assert!(!http.is_direct());
+
+		let reject = OutboundHandler::Reject(Arc::new(Reject::new()));
+		assert!(!reject.is_direct());
+	}
+
+	/// Non-Direct outbounds do local family selection through the proxy, not
+	/// tuic, so they report no mode.
+	#[test]
+	fn test_direct_mode_none_for_non_direct() {
+		let socks = OutboundHandler::Socks5 {
+			inner:     Arc::new(Socks5::new("127.0.0.1:1080")),
+			allow_udp: true,
+		};
+		assert_eq!(socks.direct_mode(), None);
+
+		let http = OutboundHandler::Http(Arc::new(Http::from_url("http://127.0.0.1:8080").unwrap()));
+		assert_eq!(http.direct_mode(), None);
+
+		let reject = OutboundHandler::Reject(Arc::new(Reject::new()));
+		assert_eq!(reject.direct_mode(), None);
 	}
 
 	/// Test ACL rule matching with http outbound

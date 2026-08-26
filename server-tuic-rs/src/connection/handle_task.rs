@@ -1,4 +1,7 @@
-use std::{collections::hash_map::Entry, net::SocketAddr};
+use std::{
+	collections::hash_map::Entry,
+	net::{IpAddr, Ipv4Addr, SocketAddr},
+};
 
 use bytes::Bytes;
 use eyre::eyre;
@@ -11,7 +14,7 @@ use tuic::{
 
 use super::{Connection, ERROR_CODE, UdpSession};
 use crate::{
-	acl::{Addr, OutboundHandler, Protocol},
+	acl::{Addr, DirectMode, OutboundHandler, Protocol},
 	dns::{ResolveDecision, resolve_decision},
 	io::copy_io,
 	stats,
@@ -99,7 +102,7 @@ impl Connection {
 			// Check if the peer address should be blocked (experimental filters)
 			// Only check for Direct outbound - for proxied connections (Socks5, etc.),
 			// peer_addr() returns the proxy server address, not the actual target
-			if matches!(outbound.as_ref(), OutboundHandler::Direct(_)) {
+			if outbound.is_direct() {
 				if let Ok(peer_addr) = tcp_conn.peer_addr() {
 					if self.should_drop_address(&peer_addr) {
 						debug!(
@@ -173,14 +176,14 @@ impl Connection {
 				None => {
 					// No match, use default direct
 					std::sync::Arc::new(OutboundHandler::Direct(std::sync::Arc::new(
-						acl_engine_rs::outbound::Direct::new(),
+						crate::acl::DirectOutbound::with_mode(DirectMode::Auto),
 					)))
 				}
 			}
 		} else {
 			// No ACL engine, use default direct
 			std::sync::Arc::new(OutboundHandler::Direct(std::sync::Arc::new(
-				acl_engine_rs::outbound::Direct::new(),
+				crate::acl::DirectOutbound::with_mode(DirectMode::Auto),
 			)))
 		}
 	}
@@ -271,7 +274,23 @@ impl Connection {
 				return Ok(());
 			}
 
-			// Use acl-engine-rs's async outbound to get UDP connection
+			// tuic relays UDP through its own UdpSession using the node's local
+			// sockets, which only correctly represents a Direct outbound. A proxied
+			// outbound (socks5/http) can't be honored for UDP without sending from
+			// the node directly — that would bypass the proxy and leak the node's
+			// real IP — so reject UDP for proxied outbounds instead of bypassing.
+			if !outbound.is_direct() {
+				debug!(
+					"[{id:#010x}] [{addr}] [{user}] [UDP-OUT] [{assoc_id:#06x}] [from-{mode}] [{pkt_id:#06x}] to {src_addr} \
+					 blocked (UDP not supported for proxied outbound)",
+					id = self.id(),
+					addr = self.inner.remote_address(),
+					user = self.auth,
+					src_addr = addr,
+				);
+				return Ok(());
+			}
+
 			let mut acl_addr = address_to_acl_addr(&addr);
 
 			// Front-load DNS resolution (same rationale as the TCP path). On
@@ -295,34 +314,31 @@ impl Connection {
 				}
 			}
 
-			let udp_conn = outbound
-				.as_async_outbound()
-				.dial_udp(&mut acl_addr)
-				.await
-				.map_err(|e| eyre!("Failed to create UDP connection: {}", e))?;
+			// Ordered send targets honoring the Direct family-selection mode
+			// (Prefer64/Prefer46/Only*). Slot 0 is the preferred family; slot 1 is
+			// the other family, tried as a send-time fallback — the UDP analogue of
+			// v0.4.6's TCP connection-level Prefer fallback.
+			let candidates = udp_target_candidates(outbound.direct_mode(), &acl_addr);
+			if candidates.iter().all(Option::is_none) {
+				// Nothing resolved to a usable address for this mode (e.g. an
+				// Only4 outbound whose target has only an AAAA record).
+				return Err(eyre!("no usable UDP target address").into());
+			}
 
-			// Get the resolved address for sending
-			let socket_addr = acl_addr
-				.resolve_info()
-				.as_ref()
-				.and_then(|info| {
-					info.ipv4
-						.map(|ipv4| SocketAddr::new(std::net::IpAddr::V4(ipv4), acl_addr.port()))
-						.or_else(|| {
-							info.ipv6
-								.map(|ipv6| SocketAddr::new(std::net::IpAddr::V6(ipv6), acl_addr.port()))
-						})
-				})
-				.or_else(|| {
-					// Try to parse the host as a socket address
-					format!("{}:{}", acl_addr.host(), acl_addr.port()).parse().ok()
-				})
-				.ok_or_else(|| eyre!("Failed to resolve UDP target address"))?;
-
-			// Check if address should be blocked (experimental filters)
-			// Only check for Direct outbound - for proxied connections, the target
-			// is handled by the proxy and we shouldn't block based on resolved address
-			if matches!(outbound.as_ref(), OutboundHandler::Direct(_)) && self.should_drop_address(&socket_addr) {
+			// Collect the send targets on the stack (allocation-free hot path).
+			// Apply the experimental drop filter to *every* candidate we might fall
+			// back to, so a fallback family can't reach a private/loopback host the
+			// primary check would have blocked. (Only Direct reaches here.)
+			let mut targets = [SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0); 2];
+			let mut target_count = 0;
+			for target in candidates.into_iter().flatten() {
+				if self.should_drop_address(&target) {
+					continue;
+				}
+				targets[target_count] = target;
+				target_count += 1;
+			}
+			if target_count == 0 {
 				debug!(
 					"[{id:#010x}] [{addr}] [{user}] [UDP-OUT] [{assoc_id:#06x}] [from-{mode}] [{pkt_id:#06x}] to {src_addr} \
 					 blocked (loopback/private)",
@@ -333,9 +349,7 @@ impl Connection {
 				);
 				return Ok(());
 			}
-
-			// Drop the UDP connection from acl-engine-rs (we use our own UdpSession)
-			drop(udp_conn);
+			let targets = &targets[..target_count];
 
 			// Record traffic and request stats for UDP outbound
 			if self.auth.is_authenticated() {
@@ -345,7 +359,7 @@ impl Connection {
 			}
 
 			if let Some(session) = session.upgrade() {
-				session.send(pkt, socket_addr).await
+				session.send(pkt, targets).await
 			} else {
 				Err(eyre!("UdpSession dropped already").into())
 			}
@@ -422,11 +436,159 @@ impl Connection {
 	}
 }
 
+/// Ordered UDP send targets for a resolved address, honoring the Direct
+/// family-selection `mode`. Slot 0 is the preferred family; slot 1 (if
+/// resolved) is the other family used as a send-time fallback, mirroring
+/// acl-engine's Prefer64/Prefer46 UDP semantics. `None` (non-Direct outbound)
+/// and Auto/Prefer46 prefer IPv4 for compatibility. Targets without
+/// `resolve_info` (IP literals) fall back to parsing the host string into a
+/// single candidate.
+///
+/// Returns a fixed-size array (allocation-free on the per-datagram hot path);
+/// `None` slots are skipped by callers via `.flatten()`.
+fn udp_target_candidates(mode: Option<DirectMode>, acl_addr: &Addr) -> [Option<SocketAddr>; 2] {
+	let port = acl_addr.port();
+
+	// Prefer explicit resolve_info; otherwise treat an IP-literal host as a
+	// single resolved address of its own family. Parsing the host as an IpAddr
+	// (rather than `format!("{host}:{port}")`) handles IPv6 literals, which need
+	// bracketing in the `host:port` form.
+	let (v4, v6) = if let Some(info) = acl_addr.resolve_info().as_ref() {
+		(
+			info.ipv4.map(|ip| SocketAddr::new(IpAddr::V4(ip), port)),
+			info.ipv6.map(|ip| SocketAddr::new(IpAddr::V6(ip), port)),
+		)
+	} else {
+		match acl_addr.host().parse::<IpAddr>() {
+			Ok(ip @ IpAddr::V4(_)) => (Some(SocketAddr::new(ip, port)), None),
+			Ok(ip @ IpAddr::V6(_)) => (None, Some(SocketAddr::new(ip, port))),
+			Err(_) => (None, None),
+		}
+	};
+
+	match mode {
+		Some(DirectMode::Prefer64) => [v6, v4],
+		Some(DirectMode::Only6) => [v6, None],
+		Some(DirectMode::Only4) => [v4, None],
+		// Auto | Prefer46 | None (non-Direct): IPv4 first for compatibility.
+		_ => [v4, v6],
+	}
+}
+
 /// Convert tuic Address to acl-engine-rs Addr
 fn address_to_acl_addr(addr: &Address) -> Addr {
 	match addr {
 		Address::DomainAddress(domain, port) => Addr::new(domain.as_str(), *port),
 		Address::SocketAddress(sock_addr) => Addr::new(sock_addr.ip().to_string(), sock_addr.port()),
 		Address::None => Addr::new("", 0),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+	use acl_engine_rs::outbound::{DirectMode, ResolveInfo};
+
+	use super::*;
+
+	fn v4(a: u8, b: u8, c: u8, d: u8, port: u16) -> SocketAddr {
+		SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), port)
+	}
+
+	fn v6_localhost(port: u16) -> SocketAddr {
+		SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port)
+	}
+
+	fn dual_addr(port: u16) -> Addr {
+		Addr::new("dual.example", port).with_resolve_info(ResolveInfo {
+			ipv4:  Some(Ipv4Addr::new(1, 2, 3, 4)),
+			ipv6:  Some(Ipv6Addr::LOCALHOST),
+			error: None,
+		})
+	}
+
+	#[test]
+	fn prefer64_orders_ipv6_then_ipv4() {
+		let addr = dual_addr(443);
+		assert_eq!(
+			udp_target_candidates(Some(DirectMode::Prefer64), &addr),
+			[Some(v6_localhost(443)), Some(v4(1, 2, 3, 4, 443))]
+		);
+	}
+
+	#[test]
+	fn prefer46_orders_ipv4_then_ipv6() {
+		let addr = dual_addr(443);
+		assert_eq!(
+			udp_target_candidates(Some(DirectMode::Prefer46), &addr),
+			[Some(v4(1, 2, 3, 4, 443)), Some(v6_localhost(443))]
+		);
+	}
+
+	#[test]
+	fn auto_and_non_direct_prefer_ipv4_then_ipv6() {
+		let addr = dual_addr(443);
+		let expected = [Some(v4(1, 2, 3, 4, 443)), Some(v6_localhost(443))];
+		assert_eq!(udp_target_candidates(Some(DirectMode::Auto), &addr), expected);
+		// `None` == non-Direct outbound: keep the compatibility-first v4 order.
+		assert_eq!(udp_target_candidates(None, &addr), expected);
+	}
+
+	#[test]
+	fn only6_and_only4_yield_single_family() {
+		let addr = dual_addr(443);
+		assert_eq!(
+			udp_target_candidates(Some(DirectMode::Only6), &addr),
+			[Some(v6_localhost(443)), None]
+		);
+		assert_eq!(
+			udp_target_candidates(Some(DirectMode::Only4), &addr),
+			[Some(v4(1, 2, 3, 4, 443)), None]
+		);
+	}
+
+	#[test]
+	fn missing_preferred_family_is_skipped() {
+		// Prefer64 with a v4-only resolution: no IPv6 candidate, so slot 0 is
+		// None and only the IPv4 target remains (callers skip None via flatten).
+		let addr = Addr::new("v4.example", 53).with_resolve_info(ResolveInfo::from_ipv4(Ipv4Addr::new(9, 9, 9, 9)));
+		assert_eq!(
+			udp_target_candidates(Some(DirectMode::Prefer64), &addr),
+			[None, Some(v4(9, 9, 9, 9, 53))]
+		);
+	}
+
+	#[test]
+	fn ip_literal_without_resolve_info_parses_host() {
+		// SocketAddress targets carry no resolve_info; the host string is a
+		// literal IP that must be parsed into a single candidate.
+		let addr = Addr::new("203.0.113.7", 8080);
+		assert_eq!(
+			udp_target_candidates(Some(DirectMode::Auto), &addr),
+			[Some(v4(203, 0, 113, 7, 8080)), None]
+		);
+	}
+
+	#[test]
+	fn ipv6_literal_without_resolve_info_is_parsed() {
+		// An IPv6-literal target with no resolve_info must still yield a
+		// candidate. Naive `format!("{host}:{port}")` produces an unbracketed,
+		// unparseable string for IPv6 — the host has to be parsed as an IpAddr.
+		// Prefer64 puts the (only) v6 candidate in slot 0.
+		let addr = Addr::new("2606:4700:4700::1111", 443);
+		let expected = SocketAddr::new(IpAddr::V6("2606:4700:4700::1111".parse().unwrap()), 443);
+		assert_eq!(
+			udp_target_candidates(Some(DirectMode::Prefer64), &addr),
+			[Some(expected), None]
+		);
+	}
+
+	#[test]
+	fn only4_with_ipv6_literal_yields_no_target() {
+		// Family mode applies to IP literals too: an Only4 outbound cannot use an
+		// IPv6-literal target, so there is no candidate (the packet is dropped).
+		let addr = Addr::new("2606:4700:4700::1111", 443);
+		assert_eq!(udp_target_candidates(Some(DirectMode::Only4), &addr), [None, None]);
 	}
 }
