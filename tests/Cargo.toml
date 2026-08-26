@@ -29,6 +29,6 @@ fast-socks5 = { version = "1.0.0" }
 rustls = { version = "0.23", default-features = false }
 tracing-test = { version = "0.2" }
 tracing = "0.1"
-serial_test = "3"
+serial_test = "4"
 aws-lc-rs = { version = "1", default-features = false, optional = true, features = ["prebuilt-nasm"] }
 server-client-rs = { git = "https://github.com/xflash-panda/server-client-rs", branch = "dev" }
