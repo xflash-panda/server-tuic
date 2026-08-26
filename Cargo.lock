@@ -4,8 +4,8 @@ version = 4
 
 [[package]]
 name = "acl-engine-rs"
-version = "0.4.5"
-source = "git+https://github.com/xflash-panda/acl-engine-rs?tag=v0.4.5#e8202ff4f4f2a9660321f5afdf71a89aeeae0859"
+version = "0.4.6"
+source = "git+https://github.com/xflash-panda/acl-engine-rs?tag=v0.4.6#88a71e6243638b02761ff8bc76f91ab659f68b9a"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1217,7 +1217,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -1933,7 +1933,7 @@ dependencies = [
  "quinn-udp 0.5.15",
  "rustc-hash",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -1953,7 +1953,7 @@ dependencies = [
  "quinn-udp 0.6.1",
  "rustc-hash",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -2027,7 +2027,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -2039,7 +2039,7 @@ source = "git+https://github.com/Tipuch/quinn.git?branch=bbrv3#762128e9e8017e8ff
 dependencies = [
  "cfg_aliases",
  "libc",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -2570,7 +2570,7 @@ dependencies = [
 
 [[package]]
 name = "server-tuic-agent"
-version = "0.4.14"
+version = "0.4.15"
 dependencies = [
  "acl-engine-rs",
  "anyhow",
@@ -2804,7 +2804,7 @@ dependencies = [
 
 [[package]]
 name = "tests"
-version = "0.4.14"
+version = "0.4.15"
 dependencies = [
  "aws-lc-rs",
  "eyre",
@@ -3241,7 +3241,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tuic-core"
-version = "0.4.14"
+version = "0.4.15"
 dependencies = [
  "bytes",
  "eyre",

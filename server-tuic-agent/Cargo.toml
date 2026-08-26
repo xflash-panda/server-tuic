@@ -65,7 +65,7 @@ pest = "2.8"
 pest_derive = "2.8"
 
 # ACL Engine
-acl-engine-rs = { git = "https://github.com/xflash-panda/acl-engine-rs", tag = "v0.4.5" }
+acl-engine-rs = { git = "https://github.com/xflash-panda/acl-engine-rs", tag = "v0.4.6" }
 
 # DNS Cache
 dns-cache-rs = { git = "https://github.com/xflash-panda/dns-cache-rs.git", branch = "dev" }
